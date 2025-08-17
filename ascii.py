@@ -1,16 +1,14 @@
-import cv2
 import numpy as np
 import os
 import time
 import platform
 import shutil
-import random
 import sys
-import textwrap
 import argparse
 from functools import lru_cache
 from datetime import datetime, timedelta
 from collections import deque
+import cv2
 
 if platform.system() == "Windows":
     import msvcrt
@@ -82,10 +80,11 @@ def adjust_frame(frame, brightness=0, contrast=1.0):
     return frame
 
 def frame_to_ascii(frame, brightness_map, term_w, term_h, scale_factor=1.0, 
-                  char_aspect_ratio=2.0, use_block_char=False, use_color=True, is_image=0):
+                  char_aspect_ratio=2.0, use_block_char=False, use_color=True, is_image=0,
+                  offset_x=0, offset_y=0, max_output=False):
     
     if term_w <= 0 or term_h <= 0:
-        return ""
+        return "", 0, 0
     
     if is_image == 1:
         video_display_height = max(1, term_h)
@@ -95,21 +94,25 @@ def frame_to_ascii(frame, brightness_map, term_w, term_h, scale_factor=1.0,
     h, w = frame.shape[:2]
     
     # 计算最大宽度和高度限制
-    max_width = int(term_w * scale_factor)
-    if is_image == 1:
-        max_height = float('inf')
+    if max_output:
+        # 最大输出模式：使用原始尺寸，不限制大小
+        target_width, target_height = w, h
     else:
-        max_height = int(video_display_height * scale_factor)
-    
-    target_width, target_height = calculate_scaled_size(
-        w, h, 
-        max_width, 
-        max_height,
-        char_aspect_ratio
-    )
+        max_width = int(term_w * scale_factor)
+        if is_image == 1:
+            max_height = float('inf')
+        else:
+            max_height = int(video_display_height * scale_factor)
+        
+        target_width, target_height = calculate_scaled_size(
+            w, h, 
+            max_width, 
+            max_height,
+            char_aspect_ratio
+        )
     
     if target_width < 2 or target_height < 2:
-        return ""
+        return "", 0, 0
     
     # 插值调整大小
     frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
@@ -120,13 +123,38 @@ def frame_to_ascii(frame, brightness_map, term_w, term_h, scale_factor=1.0,
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     output_lines = []
     
-    for i in range(h):
+    # 计算视图范围
+    start_y = max(0, min(h, offset_y))
+    end_y = min(h, start_y + term_h)
+    start_x = max(0, min(w, offset_x))
+    end_x = min(w, start_x + term_w)
+    
+    # 只在图片查看模式下添加填充
+    if is_image == 1:
+        # 计算上下填充行数
+        pad_top = max(0, (term_h - (end_y - start_y)) // 2)
+        pad_bottom = max(0, term_h - (end_y - start_y) - pad_top)
+        
+        # 计算左右填充列数
+        pad_left = max(0, (term_w - (end_x - start_x)) // 2)
+        pad_right = max(0, term_w - (end_x - start_x) - pad_left)
+        
+        # 输出顶部填充行
+        for _ in range(pad_top):
+            output_lines.append(' ' * term_w)
+    
+    for i in range(start_y, end_y):
         line = []
         if use_color:
             line.append("\033[0m")
         
         prev_r, prev_g, prev_b = -1, -1, -1
-        for j in range(w):
+        
+        # 图片查看模式下添加左侧填充
+        if is_image == 1 and pad_left > 0:
+            line.append(' ' * pad_left)
+        
+        for j in range(start_x, end_x):
             brightness_val = gray_frame[i, j]      
             if use_color:
                 r, g, b = rgb_frame[i, j]
@@ -139,15 +167,24 @@ def frame_to_ascii(frame, brightness_map, term_w, term_h, scale_factor=1.0,
             else:
                 line.append(brightness_map[brightness_val])
         
+        # 图片查看模式下添加右侧填充
+        if is_image == 1 and pad_right > 0:
+            line.append(' ' * pad_right)
+        
         output_lines.append(''.join(line))
     
-    return '\n'.join(output_lines)
+    # 图片查看模式下添加底部填充行
+    if is_image == 1:
+        for _ in range(pad_bottom):
+            output_lines.append(' ' * term_w)
+    
+    return '\n'.join(output_lines), w, h
 
 def format_duration(seconds):
     return str(timedelta(seconds=int(seconds)))
 
 def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False, use_color=True,
-                            brightness=0, contrast=1.0):
+                            brightness=0, contrast=1.0, max_output=False):
     if not os.path.exists(image_path):
         print(f"错误: 文件不存在 - {image_path}")
         return
@@ -169,11 +206,19 @@ def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False,
 
         # 初始化参数
         current_scale = scale_factor
+        initial_scale = scale_factor  # 保存初始缩放值用于模式切换
         current_brightness = brightness
         current_contrast = contrast
         current_use_block_char = use_block_char
         current_use_color = use_color
         image_filename = os.path.basename(image_path)
+        
+        # 位置偏移和最大输出模式参数
+        offset_x = 0
+        offset_y = 0
+        total_width = 0
+        total_height = 0
+        max_output_mode = max_output
         
         # ANSI 控制序列
         clear_screen = "\033[2J"
@@ -185,7 +230,6 @@ def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False,
         print(hide_cursor)
         
         # 状态变量
-        paused = False
         last_terminal_check = time.time()
         terminal_check_interval = 0.5
         term_w, term_h = get_terminal_size()
@@ -195,36 +239,56 @@ def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False,
         
         def refresh_display():
             """刷新图像显示"""
-            nonlocal term_w, term_h
-            print(clear_screen)
+            nonlocal term_w, term_h, offset_x, offset_y, total_width, total_height
             
             # 应用当前调整参数
             adjusted_image = adjust_frame(original_image.copy(), current_brightness, current_contrast)
             
+            # 生成ASCII艺术
+            ascii_art, w, h = frame_to_ascii(
+                adjusted_image, brightness_map, term_w, term_h - 3, 
+                current_scale, 
+                use_block_char=current_use_block_char, 
+                use_color=current_use_color, 
+                is_image=1,
+                offset_x=offset_x, 
+                offset_y=offset_y,
+                max_output=max_output_mode
+            )
+            
+            # 更新总尺寸
+            total_width = w
+            total_height = h
+            
+            # 确保偏移在有效范围内
+            offset_x = max(0, min(total_width - term_w, offset_x))
+            offset_y = max(0, min(total_height - term_h, offset_y))
+            
+            # 清除并显示
+            print(f"{move_cursor_top}{ascii_art}")
+            
             # 显示状态信息
             status_parts = [
                 f"文件: {image_filename}",
-                f"缩放: {current_scale:.1f}x",
+                f"缩放: {current_scale:.1f}x{' (禁用)' if max_output_mode else ''}",
                 f"亮度: {current_brightness}",
                 f"对比度: {current_contrast:.1f}",
                 f"模式: {'块字符' if current_use_block_char else 'ASCII'}",
-                f"颜色: {'开' if current_use_color else '关'}"
+                f"颜色: {'开' if current_use_color else '关'}",
+                f"最大输出: {'开' if max_output_mode else '关'}"
             ]
             
-            status_lines = format_progress_line(status_parts, term_w)
-
-            # 生成ASCII艺术
-            ascii_art = frame_to_ascii(adjusted_image, brightness_map, term_w, term_h, 
-                                      current_scale, use_block_char=current_use_block_char, 
-                                      use_color=current_use_color, is_image=1)
+            # 添加位置信息
+            if total_width > 0 and total_height > 0:
+                status_parts.append(f"位置: X:{offset_x} Y:{offset_y} (总:{total_width}x{total_height})")
             
-            print(f"{move_cursor_top}{ascii_art}")
+            status_lines = format_progress_line(status_parts, term_w)
             
             for i, line in enumerate(status_lines):
                 print(f"{clear_line}{line}")
             
             # 显示操作提示
-            print(f"{clear_line}按 'i' 查看帮助 | 按 'q' 退出 | 按 's' 保存截图")
+            print(f"{clear_line}按 'i' 查看帮助 | 按 'q' 退出 | 按 's' 保存截图 | 按 'm' 切换最大输出模式")
         
         refresh_display()
         
@@ -238,6 +302,13 @@ def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False,
                 if (new_term_w, new_term_h) != last_term_size:
                     term_w, term_h = new_term_w, new_term_h
                     last_term_size = (term_w, term_h)
+                    # 终端尺寸变化时调整偏移以保持视图中心
+                    center_x = offset_x + last_term_size[0] // 2
+                    center_y = offset_y + last_term_size[1] // 2
+                    
+                    offset_x = max(0, min(total_width - term_w, center_x - term_w // 2))
+                    offset_y = max(0, min(total_height - term_h, center_y - term_h // 2))
+                    
                     refresh_display()
                 last_terminal_check = current_time
             
@@ -277,16 +348,82 @@ def interactive_image_viewer(image_path, scale_factor=1.0, use_block_char=False,
             elif key == 'contrast_down':
                 current_contrast = max(0.1, current_contrast - 0.1)
                 refresh_display()
-            elif key == 'fast':  # 缩放放大
-                current_scale = min(1.0, current_scale + 0.1)
+            elif key == 'fast' and not max_output_mode:  # 缩放放大，最大模式下禁用
+                # 保存当前中心位置
+                center_x = offset_x + term_w // 2
+                center_y = offset_y + term_h // 2
+                
+                # 应用缩放
+                old_scale = current_scale
+                current_scale = min(20.0, current_scale + 0.2)
+                
+                # 计算新偏移以保持中心位置
+                scale_ratio = current_scale / old_scale
+                offset_x = max(0, min(total_width - term_w, int(center_x * scale_ratio - term_w // 2)))
+                offset_y = max(0, min(total_height - term_h, int(center_y * scale_ratio - term_h // 2)))
+                
                 refresh_display()
-            elif key == 'slow':  # 缩放缩小
-                current_scale = max(0.1, current_scale - 0.1)
+            elif key == 'slow' and not max_output_mode:  # 缩放缩小，最大模式下禁用
+                # 保存当前中心位置
+                center_x = offset_x + term_w // 2
+                center_y = offset_y + term_h // 2
+                
+                # 应用缩放
+                old_scale = current_scale
+                current_scale = max(0.1, current_scale - 0.2)
+                
+                # 计算新偏移以保持中心位置
+                scale_ratio = current_scale / old_scale
+                offset_x = max(0, min(total_width - term_w, int(center_x * scale_ratio - term_w // 2)))
+                offset_y = max(0, min(total_height - term_h, int(center_y * scale_ratio - term_h // 2)))
+                
                 refresh_display()
-            elif key and key.startswith('speed_'):
-                # 快速缩放设置
+            elif key and key.startswith('speed_') and not max_output_mode:  # 快速缩放设置，最大模式下禁用
+                # 保存当前中心位置
+                center_x = offset_x + term_w // 2
+                center_y = offset_y + term_h // 2
+                
+                # 应用缩放
+                old_scale = current_scale
                 speed_value = float(key.split('_')[1])
-                current_scale = max(0.1, min(1.0, speed_value))
+                current_scale = max(0.1, min(5.0, speed_value))
+                
+                # 计算新偏移以保持中心位置
+                scale_ratio = current_scale / old_scale
+                offset_x = max(0, min(total_width - term_w, int(center_x * scale_ratio - term_w // 2)))
+                offset_y = max(0, min(total_height - term_h, int(center_y * scale_ratio - term_h // 2)))
+                
+                refresh_display()
+            elif key == 'toggle_max_output':  # 切换最大输出模式
+                max_output_mode = not max_output_mode
+                # 切换模式时重置缩放和位置
+                if max_output_mode:
+                    # 进入最大输出模式，保存当前缩放并使用原始尺寸
+                    initial_scale = current_scale
+                    current_scale = 1.0  # 最大模式下缩放固定为1.0
+                else:
+                    # 退出最大输出模式，恢复之前的缩放
+                    current_scale = initial_scale
+                
+                # 重置位置到中心
+                offset_x = max(0, (total_width - term_w) // 2)
+                offset_y = max(0, (total_height - term_h) // 2)
+                refresh_display()
+            elif key == 'up' and total_height > 0:
+                # 向上移动，一次移动5行更实用
+                offset_y = max(0, offset_y - 5)
+                refresh_display()
+            elif key == 'down' and total_height > 0:
+                # 向下移动
+                offset_y = max(0, min(total_height - term_h, offset_y + 5))
+                refresh_display()
+            elif key == 'left' and total_width > 0:
+                # 向左移动
+                offset_x = max(0, offset_x - 5)
+                refresh_display()
+            elif key == 'right' and total_width > 0:
+                # 向右移动
+                offset_x = max(0, min(total_width - term_w, offset_x + 5))
                 refresh_display()
             
             time.sleep(0.01)
@@ -359,6 +496,7 @@ def get_key_press():
             elif key == b'[': return 'contrast_down'
             elif key == b']': return 'contrast_up'
             elif key == b'l' or key == b'L': return 'toggle_loop'
+            elif key == b'm' or key == b'M': return 'toggle_max_output'  # 最大输出模式切换
             return None
     else:
         fd = sys.stdin.fileno()
@@ -395,6 +533,7 @@ def get_key_press():
                 elif key == '[': return 'contrast_down'
                 elif key == ']': return 'contrast_up'
                 elif key.lower() == 'l': return 'toggle_loop'
+                elif key.lower() == 'm': return 'toggle_max_output'  # 最大输出模式切换
             return None
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -417,12 +556,13 @@ def show_help_info():
     print("=" * 60)
     print("                操作帮助")
     print("=" * 60)
+    print("  方向键: 移动视图 (一次移动5个单位)")
     print("  空格键: 暂停/继续播放")
     print("  左方向键: 快退5秒")
     print("  右方向键: 快进5秒")
-    print("  ,键: 降低播放速度")
-    print("  .键: 提高播放速度")
-    print("  0-5键: 快速设置速度 (0=0.25x, 1=0.5x, 2=1.0x, 3=1.5x, 4=2.0x, 5=4.0x)")
+    print("  ,键: 缩小图像/降低播放速度")
+    print("  .键: 放大图像/提高播放速度")
+    print("  0-5键: 快速设置缩放/速度 (0=0.25x, 1=0.5x, 2=1.0x, 3=1.5x, 4=2.0x, 5=4.0x)")
     print("  r键: 重置播放速度为1.0x")
     print("  i键: 显示/隐藏本帮助信息")
     print("  F键: 切换显示模式 (ASCII字符 / 块字符)")
@@ -435,9 +575,10 @@ def show_help_info():
     print("  [键: 降低对比度")
     print("  ]键: 增加对比度")
     print("  L键: 切换循环播放")
-    print("  Q键: 退出播放")
-    print("  冷知识：本程序支持命令行参数，针对照片输出可能需要通过命令行参数进行控制")
-    print("\n按任意键继续播放...")
+    print("  M键: 切换最大输出模式 (图片专用)")
+    print("  Q键: 退出查看/播放")
+    print("  注意: 放大/缩小时以当前视图中心为基准")
+    print("\n按任意键继续...")
     print("=" * 60)
 
 def format_progress_line(parts, term_w):
@@ -488,7 +629,7 @@ def save_screenshot(frame, video_name, frame_count, use_color, use_block_char):
     term_w, term_h = get_terminal_size()
     video_display_height = max(1, term_h - 3)
     brightness_map = create_brightness_map(num_buckets=64)
-    ascii_art = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
+    ascii_art, _, _ = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
                               1.0, use_block_char=use_block_char, use_color=use_color, is_image=0)
     
     txt_filename = f"{video_name}_{timestamp}_f{frame_count}.txt"
@@ -594,7 +735,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
                 print(clear_screen)
             
             term_w, term_h = get_terminal_size()
-            video_display_height = max(1, term_h-last_term_progress_h+2)
+            video_display_height = max(1, term_h - last_term_progress_h + 3)
             
             key = get_key_press()
             if key == 'space':
@@ -662,7 +803,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
             if paused:
                 if paused_frame is not None:
                     # 显示暂停帧
-                    ascii_frame = frame_to_ascii(paused_frame, brightness_map, term_w, video_display_height, 
+                    ascii_frame, _, _ = frame_to_ascii(paused_frame, brightness_map, term_w, video_display_height, 
                                                scale_factor, use_block_char=use_block_char, use_color=use_color, is_image=0)
                     print(f"{move_cursor_top}{ascii_frame}")
                 
@@ -685,7 +826,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
                         f"进度: {progress:.1f}% ({frame_count}/{total_frames})",
                         f"已用: {format_duration(elapsed_time)}",
                         f"剩余: {format_duration(remaining_time)}",
-                        f"跳帧: {total_skipped_frames}"
+                        f"跳帧: {total_skipped_frames}",
                         f"模式: {'块字符' if use_block_char else 'ASCII'}",
                         f"颜色: {'开' if use_color else '关'}",
                         f"亮度: {brightness}",
@@ -709,7 +850,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
                         last_term_size = (new_term_w, new_term_h)
                         print(clear_screen)
                         if paused_frame is not None:
-                            ascii_frame = frame_to_ascii(paused_frame, brightness_map, new_term_w, new_term_h-3, 
+                            ascii_frame, _, _ = frame_to_ascii(paused_frame, brightness_map, new_term_w, new_term_h-3, 
                                                        scale_factor, use_block_char=use_block_char, use_color=use_color, is_image=0)
                             print(f"{move_cursor_top}{ascii_frame}")
                     last_terminal_check = current_time
@@ -743,7 +884,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
             if cache_key in frame_cache:
                 ascii_frame = frame_cache[cache_key]
             else:
-                ascii_frame = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
+                ascii_frame, _, _ = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
                                            scale_factor, use_block_char=use_block_char, use_color=use_color, is_image=0)
                 if len(frame_cache) > 30:
                     oldest_key = next(iter(frame_cache.keys()))
@@ -821,7 +962,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
                     f"进度: {progress:.1f}% ({frame_count}/{total_frames})",
                     f"已用: {format_duration(elapsed_time)}",
                     f"剩余: {format_duration(remaining_time)}",
-                    f"跳帧: {total_skipped_frames}"
+                    f"跳帧: {total_skipped_frames}",
                     f"模式: {'块字符' if use_block_char else 'ASCII'}",
                     f"颜色: {'开' if use_color else '关'}",
                     f"亮度: {brightness}",
@@ -840,7 +981,7 @@ def play_video_as_ascii(video_path, scale_factor=1.0, skip_threshold=1.0, skip_f
         
         if not last_frame_processed and not loop_play:
             # 显示最后一帧
-            ascii_frame = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
+            ascii_frame, _, _ = frame_to_ascii(frame, brightness_map, term_w, video_display_height, 
                                        scale_factor, use_block_char=use_block_char, use_color=use_color, is_image=0)
             print(f"{move_cursor_top}{ascii_frame}")
             
@@ -881,60 +1022,186 @@ def is_video_file(file_path):
     video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.mpg', '.mpeg', '.m4v', '.3gp')
     return file_path.lower().endswith(video_extensions)
 
+def get_interactive_parameters():
+    print("===== ASCII转换工具 v0.1.6 =====")
+    print("未检测到命令行参数，进入交互式模式\n")
+    
+    # 1. 获取并验证文件路径
+    while True:
+        file_path = input("请输入图片或视频文件路径: ").strip()
+        if platform.system() == "Windows":
+            file_path = file_path.strip('"\'')
+            file_path = os.path.abspath(file_path)
+        
+        if os.path.exists(file_path):
+            break
+        print(f"错误: 文件不存在 - {file_path}，请重新输入\n")
+    
+    # 2. 判断文件类型
+    is_image = is_image_file(file_path)
+    is_video = is_video_file(file_path)
+    
+    if not is_image and not is_video:
+        return None, "不支持的文件格式"
+    
+    # 3. 询问公共参数
+    # 缩放因子
+    while True:
+        try:
+            scale_input = input(f"缩放因子 (0.1-5.0, 默认: 1.0): ").strip()
+            scale_factor = float(scale_input) if scale_input else 1.0
+            scale_factor = max(0.1, min(5.0, scale_factor))
+            break
+        except ValueError:
+            print("输入无效，请输入一个数字")
+    
+    # 最大输出模式 (仅图片)
+    max_output = False
+    if is_image:
+        max_output_input = input("启用最大输出模式? (y/n, 默认: n): ").strip().lower()
+        max_output = max_output_input == 'y'
+    
+    # 彩色输出设置
+    color_input = input("启用彩色输出? (y/n, 默认: y): ").strip().lower()
+    use_color = color_input != 'n'
+    
+    # 4. 根据文件类型询问专属参数
+    params = {
+        'file_path': file_path,
+        'scale_factor': scale_factor,
+        'use_color': use_color,
+        'max_output': max_output
+    }
+    
+    if is_image:
+        # 图片专属参数
+        block_input = input("使用块字符模式? (y/n, 默认: n): ").strip().lower()
+        params['use_block'] = block_input == 'y'
+        
+        while True:
+            try:
+                brightness_input = input(f"亮度调整 (-100 到 100, 默认: 0): ").strip()
+                brightness = int(brightness_input) if brightness_input else 0
+                params['brightness'] = max(-100, min(100, brightness))
+                break
+            except ValueError:
+                print("输入无效，请输入一个整数")
+        
+        while True:
+            try:
+                contrast_input = input(f"对比度调整 (0.1 到 3.0, 默认: 1.0): ").strip()
+                contrast = float(contrast_input) if contrast_input else 1.0
+                params['contrast'] = max(0.1, min(3.0, contrast))
+                break
+            except ValueError:
+                print("输入无效，请输入一个数字")
+    
+    elif is_video:
+        # 视频专属参数
+        while True:
+            try:
+                skip_threshold_input = input(f"跳帧阈值FPS (默认: 1.0): ").strip()
+                skip_threshold = float(skip_threshold_input) if skip_threshold_input else 1.0
+                params['skip_threshold'] = skip_threshold
+                break
+            except ValueError:
+                print("输入无效，请输入一个数字")
+        
+        while True:
+            try:
+                skip_frames_input = input(f"跳帧数量 (默认: 10): ").strip()
+                skip_frames = int(skip_frames_input) if skip_frames_input else 10
+                params['skip_frames'] = skip_frames
+                break
+            except ValueError:
+                print("输入无效，请输入一个整数")
+    
+    print("\n参数输入完成，开始处理...\n")
+    return params, None
+
 if __name__ == "__main__":
     # 解析命令行参数
-    parser = argparse.ArgumentParser(prog="ascii.py", description='用途:将图片或视频转换为文本输出 本工具由Svvcvv@github制作 版本v0.1.6', 
-                                    epilog="示例: python ascii.py video.mp4 --scale 1.0 --block //关于播放时的操作帮助在播放时按i显示")
-    parser.add_argument('file_path', help='图片或视频文件路径')
-    parser.add_argument('--scale', type=float, default=1.0, 
-                        help='缩放因子 (0.1-1.0, 默认: 1.0)')
-    parser.add_argument('--block', action='store_true', 
-                        help='使用块字符模式 (默认: ASCII字符)')
-    parser.add_argument('--no-color', action='store_true', 
-                        help='禁用彩色输出 (默认: 启用颜色)')
-    parser.add_argument('--skip-threshold', type=float, default=1.0, 
-                        help='跳帧阈值FPS (默认: 1.0)')
-    parser.add_argument('--skip-frames', type=int, default=10, 
-                        help='跳帧数量 (默认: 10)')
-    parser.add_argument('--aspect-ratio', type=float, default=2.0, 
-                        help='字符宽高比 (默认: 2.0)')
-    parser.add_argument('--brightness', type=int, default=0, 
-                        help='初始亮度调整 (-100 到 100, 默认: 0)')
-    parser.add_argument('--contrast', type=float, default=1.0, 
-                        help='初始对比度调整 (0.1 到 3.0, 默认: 1.0)')
-    parser.add_argument('--loop', action='store_true', 
-                        help='启用循环播放')
+    parser = argparse.ArgumentParser(
+        prog="ASCII.exe", 
+        description='用途:将图片或视频转换为文本输出', 
+        epilog="示例: python ascii.py image.jpg --scale 1.0 --block 关于操作帮助在查看时按i显示"
+    )
+    parser.add_argument('file_path', nargs='?', help='图片或视频文件路径')
+    parser.add_argument('--scale', type=float, default=1.0, help='缩放因子 (0.1-5.0, 默认: 1.0)')
+    parser.add_argument('--block', action='store_true', help='使用块字符模式 (仅图片，默认: ASCII字符)')
+    parser.add_argument('--no-color', action='store_true', help='禁用彩色输出 (默认: 启用颜色)')
+    parser.add_argument('--skip-threshold', type=float, default=1.0, help='跳帧阈值FPS (仅视频，默认: 1.0)')
+    parser.add_argument('--skip-frames', type=int, default=10, help='跳帧数量 (仅视频，默认: 10)')
+    parser.add_argument('--brightness', type=int, default=0, help='亮度调整 (-100 到 100, 仅图片，默认: 0)')
+    parser.add_argument('--contrast', type=float, default=1.0, help='对比度调整 (0.1 到 3.0, 仅图片，默认: 1.0)')
+    parser.add_argument('--max-output', action='store_true', help='最大输出模式 (仅图片，默认: 关闭)')
     
     args = parser.parse_args()
     
-    file_path = args.file_path
-    scale_factor = max(0.1, min(1.0, args.scale))
-    brightness = max(-100, min(100, args.brightness))
-    contrast = max(0.1, min(3.0, args.contrast))
+    # 初始化参数
+    params = None
+    error_msg = None
     
-    if platform.system() == "Windows":
-        file_path = file_path.strip('"\'')
-        file_path = os.path.abspath(file_path)
+    # 交互式输入模式
+    if args.file_path is None:
+        params, error_msg = get_interactive_parameters()
+        if error_msg:
+            print(f"错误: {error_msg}: {params['file_path']}" if params else f"错误: {error_msg}")
+            sys.exit(1)
+    else:
+        # 命令行参数模式
+        file_path = args.file_path
+        if platform.system() == "Windows":
+            file_path = file_path.strip('"\'')
+            file_path = os.path.abspath(file_path)
+        
+        if not os.path.exists(file_path):
+            print(f"错误: 文件不存在 - {file_path}")
+            sys.exit(1)
+        
+        # 公共参数
+        params = {
+            'file_path': file_path,
+            'scale_factor': max(0.1, min(5.0, args.scale)),
+            'use_color': not args.no_color,
+            'max_output': args.max_output
+        }
+        
+        # 按文件类型处理专属参数
+        if is_image_file(file_path):
+            params.update({
+                'use_block': args.block,
+                'brightness': max(-100, min(100, args.brightness)),
+                'contrast': max(0.1, min(3.0, args.contrast))
+            })
+        elif is_video_file(file_path):
+            params.update({
+                'skip_threshold': args.skip_threshold,
+                'skip_frames': args.skip_frames
+            })
+        else:
+            print(f"不支持的文件格式: {file_path}")
+            sys.exit(1)
     
-    if not os.path.exists(file_path):
-        print(f"错误: 文件不存在 - {file_path}")
-        sys.exit(1)
-    
-    if is_image_file(file_path):
-        interactive_image_viewer(file_path, scale_factor, 
-                      use_block_char=args.block, 
-                      use_color=not args.no_color,
-                      brightness=brightness,
-                      contrast=contrast)
-    elif is_video_file(file_path):
+    # 处理文件
+    if is_image_file(params['file_path']):
+        interactive_image_viewer(
+            params['file_path'],
+            params['scale_factor'],
+            use_block_char=params.get('use_block', False),
+            use_color=params['use_color'],
+            brightness=params.get('brightness', 0),
+            contrast=params.get('contrast', 1.0),
+            max_output=params['max_output']
+        )
+    elif is_video_file(params['file_path']):
         play_video_as_ascii(
-            file_path, 
-            scale_factor, 
-            skip_threshold=args.skip_threshold, 
-            skip_frames=args.skip_frames,
-            use_color=not args.no_color
+            params['file_path'],
+            params['scale_factor'],
+            skip_threshold=params.get('skip_threshold', 1.0),
+            skip_frames=params.get('skip_frames', 10),
+            use_color=params['use_color']
         )
     else:
-        print(f"不支持的文件格式: {file_path}")
-
+        print(f"不支持的文件格式: {params['file_path']}")
         sys.exit(1)
